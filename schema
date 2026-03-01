@@ -1,17 +1,13 @@
 /* shared/schema.ts
  *
- * SafeFlow integration contract for:
- * - Map / zones / graph
- * - ML perception output
- * - Risk fusion output
- * - Routing output
- * - Incidents + assist workflow
- * - WebSocket event stream
+ * SafeFlow integration contract with TWO-LAYER ZONES:
+ * - Analysis Zones (AZ*): coarse zones used by ML for stable perception on low-res CCTV
+ * - Routing Zones (Z*): finer zones used for routing, UI, and targeted notifications
  *
  * Conventions:
- * - All coordinates are in the SAME coordinate space as the rendered map (e.g., SVG pixels).
- * - Zone membership can be polygon-based; routing edges reference zoneId directly.
- * - Location for users/incidents can be zone-level OR x/y (optional).
+ * - Coordinates are in the SAME coordinate space as rendered map (e.g., SVG pixels).
+ * - Routing zones MUST belong to exactly one analysis zone via parentAnalysisZoneId.
+ * - Graph edges reference routingZoneId (Z*), NOT analysis zone ids.
  * - Timestamps are epoch milliseconds (Date.now()).
  */
 
@@ -22,207 +18,205 @@
 export type EpochMs = number;
 export type ID = string;
 
-export type Coord2D = {
-  x: number;
-  y: number;
-};
+export type Coord2D = { x: number; y: number };
 
-/ Optional confidence value 0..1 */
-export type Confidence = number;
-
-/ Severity scale (keep simple for hackathon) */
+export type Confidence = number; // 0..1
 export type Severity = "info" | "warn" | "critical";
-
-/ Actor role determines which alerts they can receive */
 export type UserRole = "user" | "staff" | "ally" | "admin";
 
-/ For indoor demo: zone-level location is acceptable */
+/** Indoor: zone-level location is acceptable */
 export type ZoneLocation = {
+  /** Usually a routingZoneId ("Z*"). Can also be analysisZoneId ("AZ*") for debugging. */
   zoneId: ID;
-  / optional precise position if available */
   pos?: Coord2D;
 };
 
 //////////////////////////////
-// Map / Zones / Graph
+// Two-Layer Zones
 //////////////////////////////
 
-/ Zones define areas where risk is aggregated and displayed */
-export type Zone = {
-  id: ID; // e.g., "Z1"
-  name: string; // e.g., "Food Court"
-  / Polygon in map coordinate space (SVG pixels). Minimum 3 points. */
-  polygon: Coord2D[];
-  / Optional: recommended safe points in this zone (like staff desk) */
+/** Coarse zones used by ML perception for stability */
+export type AnalysisZone = {
+  id: ID; // e.g., "AZ1"
+  name: string;
+  polygon: Coord2D[]; // >= 3 points
   safePoints?: Coord2D[];
 };
 
-/ Node in navigation graph (junction, door, escalator entry, etc.) */
+/** Fine zones used by routing + UI */
+export type RoutingZone = {
+  id: ID; // e.g., "Z1"
+  name: string;
+  polygon: Coord2D[]; // >= 3 points
+  /** Required mapping to a parent analysis zone */
+  parentAnalysisZoneId: ID; // e.g., "AZ1"
+  safePoints?: Coord2D[];
+};
+
+export type ZoneMapping = {
+  routingZoneId: ID; // "Z*"
+  parentAnalysisZoneId: ID; // "AZ*"
+};
+
+//////////////////////////////
+// Map / Graph
+//////////////////////////////
+
 export type GraphNode = {
-  id: ID; // e.g., "N12"
+  id: ID;
   pos: Coord2D;
-  / Optional label (Exit A, Stair 2, etc.) */
   label?: string;
-  / Optional type */
   kind?: "junction" | "exit" | "stairs" | "elevator" | "poi";
 };
 
-/ Edge in navigation graph (corridor segment) */
 export type GraphEdge = {
-  id: ID; // e.g., "E33"
+  id: ID;
   from: ID; // nodeId
   to: ID; // nodeId
-  / Physical length in map units (or meters if you calibrate). */
   length: number;
-  / Which zone this edge belongs to (used to apply zone risk penalties). */
-  zoneId: ID;
-  / Optional: corridor capacity meta */
+  /** IMPORTANT: edges map to ROUTING zones (Z*), not analysis zones */
+  routingZoneId: ID; // "Z*"
   meta?: {
-    width?: number; // meters or relative
+    width?: number;
     isAccessible?: boolean;
     isOneWay?: boolean;
   };
 };
 
-/ Full map package */
 export type MapData = {
   mapId: ID; // e.g., "mall_demo_v1"
-  / Used by frontend for background rendering (optional) */
-  mapImageUrl?: string; // could be served by frontend/static
-  zones: Zone[];
+  mapImageUrl?: string;
+
+  /** Two-layer zones */
+  analysisZones: AnalysisZone[];
+  routingZones: RoutingZone[];
+
+  /** Convenience mapping table (backend can also compute from routingZones) */
+  zoneMapping?: ZoneMapping[];
+
   graph: {
     nodes: GraphNode[];
     edges: GraphEdge[];
   };
-  / Exits for convenience */
-  exits: ID[]; // list of nodeIds that are exits
+
+  exits: ID[]; // nodeIds
 };
 
 //////////////////////////////
-// ML Perception Contracts
+// ML Perception Contracts (Analysis Zones ONLY)
 //////////////////////////////
 
-/
- * ML Perception returns per-zone signals derived from video frames.
- * NOTE: Keep this output simple. The backend does fusion/routing.
+/**
+ * ML Perception returns signals per ANALYSIS zone (AZ*).
+ * Backend expands to routing zones (Z*) for routing/UI.
  */
 export type ZonePerception = {
-  zoneId: ID;
-  / Density score: 0..1, where 1 is "very crowded" */
-  density: number;
-  / Motion anomaly score: 0..1, where 1 is "highly abnormal / panic-like" */
-  anomaly: number;
-  / Optional metadata */
-  conf?: Confidence;
-  / Optional raw counts from detector */
+  zoneId: ID; // MUST be an AnalysisZone id, e.g. "AZ3"
+  density: number; // 0..1
+  anomaly: number; // 0..1
+  conf?: Confidence; // 0..1
   peopleCount?: number;
 };
 
-/ ML inference output for a single frame/batch */
 export type PerceptionFrameResult = {
   ts: EpochMs;
-  frameId?: ID; // optional if you track frames
+  frameId?: ID;
   zones: ZonePerception[];
 };
-/ REST: ML service endpoint signature (suggested) */
-export type MlInferFrameResponse = PerceptionFrameResult;
 
-/ REST: backend may call ML service with a frame reference; use what’s easiest */
+/** Suggested ML service REST */
 export type MlInferFrameRequest =
   | {
-      // Option A: send a frame image (base64) - not always needed for hackathon
       kind: "image_base64";
       ts: EpochMs;
       imageBase64: string; // "data:image/jpeg;base64,..."
     }
   | {
-      // Option B: send a video source + frame index (ML service loads video)
       kind: "video_ref";
       ts: EpochMs;
-      videoId: ID; // e.g., "normal_1", "crowded_2"
+      videoId: ID;
       frameIndex: number;
     };
 
+export type MlInferFrameResponse = PerceptionFrameResult;
+
 //////////////////////////////
-// Risk Fusion Output (Backend truth)
+// Backend Risk Fusion Output
 //////////////////////////////
 
-/ Backend’s fused view of each zone */
-export type ZoneRisk = {
-  zoneId: ID;
-  / Final fused risk: 0..1 */
-  risk: number;
-  / Echo sources to support explainability in UI */
+/** Fused risk per ANALYSIS zone (from ML + smoothing + thresholds) */
+export type AnalysisZoneRisk = {
+  analysisZoneId: ID; // "AZ*"
+  risk: number; // 0..1
   density?: number;
   anomaly?: number;
-  / Optional trend component (e.g., rising risk) */
   trend?: number;
-  / Severity bucket for UI + alert thresholds */
   severity: Severity;
-  / Optional confidence */
   conf?: Confidence;
 };
 
-/ Entire risk map payload */
+/** Expanded risk per ROUTING zone (used for guidance/routing) */
+export type RoutingZoneRisk = {
+  routingZoneId: ID; // "Z*"
+  /** Base inherited from parent analysis zone */
+  parentAnalysisZoneId: ID; // "AZ*"
+  risk: number; // 0..1
+  severity: Severity;
+  /** Optional: local modifiers applied on top (incidents, blocked corridor) */
+  localDelta?: number; // can be negative or positive
+  conf?: Confidence;
+};
+
 export type RiskMap = {
   ts: EpochMs;
   mapId: ID;
-  zones: ZoneRisk[];
+
+  /** Always include analysis risk (debuggable, stable) */
+  analysisZones: AnalysisZoneRisk[];
+
+  /** Optionally include expanded routing risk for UI; recommended for frontends */
+  routingZones?: RoutingZoneRisk[];
 };
 
 //////////////////////////////
 // Users & Routing
 //////////////////////////////
 
-/ Minimal user state (demo-friendly) */
 export type UserState = {
   userId: ID;
   role: UserRole;
-  / Zone-level indoor location is sufficient */
-  loc: ZoneLocation;
-  / Optional destination: an exit node or a POI node */
+  /** Usually routing zone location for the user UI */
+  loc: ZoneLocation; // loc.zoneId should be "Z*"
   destinationNodeId?: ID;
-  / Optional group id for "guardian mode" groups */
   groupId?: ID;
-  / Women-safety features toggles */
   safety?: {
     guardianMode?: boolean;
-    silentMode?: boolean; // prefer discreet notifications
-    trustedContacts?: ID[]; // in-demo ids
+    silentMode?: boolean;
+    trustedContacts?: ID[];
   };
 };
 
-/ Route computed by backend */
 export type RoutePlan = {
   userId: ID;
   ts: EpochMs;
   mapId: ID;
-  / Node path for rendering */
   pathNodeIds: ID[];
-  / Optional: edge path */
   pathEdgeIds?: ID[];
-  / Why the route updated */
   reason:
     | "initial"
     | "risk_reroute"
     | "hazard_reroute"
     | "destination_changed"
     | "manual_request";
-  / Optional: which zones were avoided */
-  avoidedZoneIds?: ID[];
-  / Optional: estimated distance/time */
-  est?: {
-    distance: number;
-    timeSec?: number;
-  };
+  avoidedRoutingZoneIds?: ID[]; // "Z*"
+  est?: { distance: number; timeSec?: number };
 };
 
-/ Backend route request (if frontend asks explicitly) */
 export type RouteRequest = {
   userId: ID;
   mapId: ID;
-  fromNodeId?: ID; // optional if backend maps user loc->nearest node
-  toNodeId: ID; // destination nodeId (exit or poi)
+  fromNodeId?: ID;
+  toNodeId: ID;
   preferAccessible?: boolean;
 };
 
@@ -245,52 +239,41 @@ export type Incident = {
   type: IncidentType;
   severity: Severity;
 
-  / Where the incident is (zone-level required, pos optional) */
-  loc: ZoneLocation;
-
-  / Optional description for staff dashboard */
+  /** For operations + routing: use ROUTING zone where incident is located */
+  loc: ZoneLocation; // loc.zoneId should be "Z*"
   description?: string;
-
-  / Optional: link incident to a reporting user */
   reporterUserId?: ID;
-
-  / How certain the system is (0..1) */
   conf?: Confidence;
 
-  / Optional: affects routing by penalizing nearby edges */
   routingImpact?: {
-    / meters or map-units radius around loc.pos; if pos missing, interpret as zone-wide */
     radius?: number;
-    / penalty added to edges within impact (tune in backend) */
     hazardPenalty?: number;
-    / if true, edges may be treated as blocked */
     isBlocking?: boolean;
+    /**
+     * Optional: explicitly list affected routing zones
+     * (useful if you don't have geometry for radius)
+     */
+    affectedRoutingZoneIds?: ID[];
   };
 
-  / Lifecycle for staff handling */
   status?: "open" | "acknowledged" | "resolved";
-  acknowledgedBy?: ID; // staff/ally userId
-  resolvedBy?: ID; // staff/ally userId
+  acknowledgedBy?: ID;
+  resolvedBy?: ID;
 };
-/ Assist request sent to staff/allies */
+
 export type AssistRequest = {
   requestId: ID;
   ts: EpochMs;
   mapId: ID;
   incidentId: ID;
-  / Who should receive it (role-based + proximity filtering happens in backend) */
   targetRole: "staff" | "ally";
-  / Provide enough info to act without revealing sensitive details */
-  loc: ZoneLocation;
+  loc: ZoneLocation; // "Z*"
   severity: Severity;
   message: string;
-  / Optional: for sorting */
-  distanceEstimate?: number; // map units or meters
-  / Whether accepting assigns responder and stops further alerts */
+  distanceEstimate?: number;
   exclusive?: boolean;
 };
 
-/ Response from staff/ally */
 export type AssistResponse = {
   requestId: ID;
   ts: EpochMs;
@@ -314,10 +297,8 @@ export type SafetySignal = {
   userId: ID;
   mapId: ID;
   type: SafetySignalType;
-  loc: ZoneLocation;
-  / Optional note shown only to staff */
+  loc: ZoneLocation; // "Z*"
   note?: string;
-  / Optional confidence */
   conf?: Confidence;
 };
 
@@ -325,61 +306,65 @@ export type SafetySignal = {
 // WebSocket Events
 //////////////////////////////
 
-/ All server -> client events share this envelope */
 export type WsServerEvent =
-  | {
-      type: "risk_update";
-      payload: RiskMap;
-    }
-  | {
-      type: "incident";
-      payload: Incident;
-    }
-  | {
-      type: "route_update";
-      payload: RoutePlan;
-    }
-  | {
-      type: "assist_request";
-      payload: AssistRequest;
-    }
-  | {
-      type: "user_update";
-      payload: UserState;
-    }
+  | { type: "risk_update"; payload: RiskMap }
+  | { type: "incident"; payload: Incident }
+  | { type: "route_update"; payload: RoutePlan }
+  | { type: "assist_request"; payload: AssistRequest }
+  | { type: "user_update"; payload: UserState }
   | {
       type: "system_status";
-      payload: {
-        ts: EpochMs;
-        mlMode: "fake" | "real";
-        fps?: number;
-        note?: string;
-      };
+      payload: { ts: EpochMs; mlMode: "fake" | "real"; fps?: number; note?: string };
     };
 
-/ Client -> server WS messages */
 export type WsClientEvent =
-  | {
-      type: "route_request";
-      payload: RouteRequest;
-    }
-  | {
-      type: "assist_response";
-      payload: AssistResponse;
-    }
-  | {
-      type: "safety_signal";
-      payload: SafetySignal;
-    }
-  | {
-      type: "user_presence";
-      payload: {
-        userId: ID;
-        ts: EpochMs;
-        /** Update location (zone-level) */
-        loc: ZoneLocation;
-      };
+  | { type: "route_request"; payload: RouteRequest }
+  | { type: "assist_response"; payload: AssistResponse }
+  | { type: "safety_signal"; payload: SafetySignal }
+  | { type: "user_presence"; payload: { userId: ID; ts: EpochMs; loc: ZoneLocation } };
+
+//////////////////////////////
+// Backend Helper Functions (optional but recommended)
+//////////////////////////////
+
+/**
+ * Expand analysis-zone risks to routing-zone risks using zone mapping.
+ * - analysisRiskById: Map<"AZ*", AnalysisZoneRisk>
+ * - routingZones: list of routing zones with parentAnalysisZoneId
+ * - localDeltasByRoutingZoneId: optional local modifiers from incidents, etc.
+ */
+export function expandRiskToRoutingZones(
+  analysisRisks: AnalysisZoneRisk[],
+  routingZones: RoutingZone[],
+  localDeltasByRoutingZoneId?: Record<string, number>
+): RoutingZoneRisk[] {
+  const byAZ: Record<string, AnalysisZoneRisk> = Object.fromEntries(
+    analysisRisks.map((r) => [r.analysisZoneId, r])
+  );
+
+  return routingZones.map((rz) => {
+    const parent = byAZ[rz.parentAnalysisZoneId];
+    const baseRisk = parent?.risk ?? 0;
+    const delta = localDeltasByRoutingZoneId?.[rz.id] ?? 0;
+    const risk = clamp01(baseRisk + delta);
+
+    const severity: Severity =
+      risk >= 0.8 ? "critical" : risk >= 0.5 ? "warn" : "info";
+
+    return {
+      routingZoneId: rz.id,
+      parentAnalysisZoneId: rz.parentAnalysisZoneId,
+      risk,
+      severity,
+      localDelta: delta || undefined,
+      conf: parent?.conf,
     };
+  });
+}
+
+export function clamp01(x: number): number {
+  return Math.max(0, Math.min(1, x));
+}
 
 //////////////////////////////
 // Example Payloads (for testing)
@@ -390,9 +375,13 @@ export const EXAMPLE_RISK_UPDATE: WsServerEvent = {
   payload: {
     ts: Date.now(),
     mapId: "mall_demo_v1",
-    zones: [
-      { zoneId: "Z1", risk: 0.12, density: 0.2, anomaly: 0.05, severity: "info" },
-      { zoneId: "Z2", risk: 0.86, density: 0.92, anomaly: 0.55, severity: "critical" },
+    analysisZones: [
+      { analysisZoneId: "AZ1", risk: 0.12, density: 0.2, anomaly: 0.05, severity: "info" },
+      { analysisZoneId: "AZ2", risk: 0.86, density: 0.92, anomaly: 0.55, severity: "critical" },
+    ],
+    routingZones: [
+      { routingZoneId: "Z1", parentAnalysisZoneId: "AZ1", risk: 0.12, severity: "info" },
+      { routingZoneId: "Z7", parentAnalysisZoneId: "AZ2", risk: 0.86, severity: "critical" },
     ],
   },
 };
@@ -420,7 +409,7 @@ export const EXAMPLE_ROUTE_UPDATE: WsServerEvent = {
     mapId: "mall_demo_v1",
     pathNodeIds: ["N1", "N5", "N9", "N12", "EXIT_A"],
     reason: "risk_reroute",
-    avoidedZoneIds: ["Z2"],
+    avoidedRoutingZoneIds: ["Z7"],
     est: { distance: 220, timeSec: 180 },
   },
 };
